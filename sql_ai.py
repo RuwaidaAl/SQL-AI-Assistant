@@ -2,31 +2,29 @@ import pandas as pd
 import sqlite3
 from groq import Groq
 from dotenv import dotenv_values
-import os
+from datetime import datetime
+from sklearn.ensemble import IsolationForest
 
 env = dotenv_values("/Users/ruwaidaalharrasi/Desktop/Capstone/.env")
 api_key = env.get("GROQ_API_KEY")
 print("Loaded key:", api_key)
 
 client = Groq(api_key=api_key)
+
 customer = pd.read_csv("customer.csv")
 account = pd.read_csv("account.csv")
 loan = pd.read_csv("loan.csv")
 transaction = pd.read_csv("transaction.csv")
 
-
+# SQLite (in-memory)
 conn = sqlite3.connect(":memory:")
-
 customer.to_sql("customer", conn, index=False, if_exists="replace")
 account.to_sql("account", conn, index=False, if_exists="replace")
 loan.to_sql("loan", conn, index=False, if_exists="replace")
-transaction.to_sql("transaction", conn, index=False, if_exists="replace")
+transaction.to_sql("transactions", conn, index=False, if_exists="replace")
 
-print("All tables loaded into SQLite!\n")
+print("\nAll tables loaded into SQLite!")
 
-# ----------------------------------
-# Build dynamic schema prompt
-# ----------------------------------
 schema = {
     "customer": list(customer.columns),
     "account": list(account.columns),
@@ -34,69 +32,70 @@ schema = {
     "transaction": list(transaction.columns),
 }
 
-SYSTEM_PROMPT = f"""You are a specialized SQL assistant for National Banking Corporation's Data Analysis Team. You have access to 4 core banking tables that can be joined for financial analysis.
+SYSTEM_PROMPT = f"""
+You are a strict SQL assistant for banking data stored in SQLite.
+Your ONLY available tables are:
 
-DATABASE SCHEMA - NATIONAL BANKING CORPORATION:
+CUSTOMER({', '.join(schema['customer'])})
+ACCOUNT({', '.join(schema['account'])})
+LOAN({', '.join(schema['loan'])})
+TRANSACTIONS({', '.join(schema['transaction'])})
 
-1. CUSTOMER({', '.join(schema['customer'])})
-   - Core customer demographic and contact information
-   
-2. ACCOUNT({', '.join(schema['account'])})
-   - All banking accounts with balances and status
-   
-3. LOAN({', '.join(schema['loan'])})
-   - Customer loan records including amounts and terms
-   
-4. TRANSACTION({', '.join(schema['transaction'])})
-   - All financial transactions across accounts
+RULES:
+1. Only use these tables/columns.
+2. No invented fields.
+3. Follow relationships:
+   - CUSTOMER.customer_id ↔ ACCOUNT.customer_id
+   - ACCOUNT.account_id ↔ TRANSACTIONS.account_id
+   - CUSTOMER.customer_id ↔ LOAN.customer_id
+4. Return only SQL. No explanation.
+5. If data is not available: respond with EXACT phrase:
+   "Data not available in current banking tables"
+"""
 
-RELATIONSHIP MAP:
-• CUSTOMER ↔ ACCOUNT: Join on customer_id
-• ACCOUNT ↔ TRANSACTION: Join on account_id  
-• CUSTOMER ↔ LOAN: Join on customer_id
-• ACCOUNT ↔ LOAN: Join on account_id (if applicable)
+FORBIDDEN = [
+    "omani", "non omani", "oman", "nationality", "citizen", "country",
+    "international", "transfer", "credit card", "visa", "mastercard",
+    "salary", "employer", "job", "income", "region", "city", "address",
+    "passport", "work", "travel"
+]
 
-CRITICAL BUSINESS RULES:
-1. Use STRICT SQLite syntax - all queries must execute in SQLite
-2. Use ONLY exact column names from the schema above
-3. Never invent or assume columns that don't exist
-4. All joins MUST use the relationship keys specified above
-5. Handle NULL values appropriately in aggregations
 
-QUERY RESPONSE PROTOCOL:
-• If question requires data/columns not in schema → Return: "Data not available in current banking tables"
-• If question requires joining tables without matching keys → Return: "No direct relationship between [Table1] and [Table2] for this analysis"
-• If question is clear and answerable → Return ONLY the SQL query with no explanations
-• Format queries cleanly with proper indentation for readability
+def get_available_data_examples():
+    """What the user *can* ask."""
+    return {
+        "customer": ["customer names", "date of birth", "phone numbers"],
+        "account": ["balances", "account types", "opening dates"],
+        "loan": ["loan amounts", "loan status"],
+        "transactions": ["transaction amounts", "dates", "types"],
+        "combined": ["customers with balances", "loans + customer info"]
+    }
 
-EXAMPLE QUESTIONS YOU CAN HANDLE:
-✓ "Show total account balance for each customer"
-✓ "Find customers with overdue loans"
-✓ "Calculate monthly transaction volume by account type"
-✓ "Identify high-value customers with multiple accounts"
+def is_invalid_question(q):
+    q = q.lower()
 
-YOUR MISSION: Convert banking business questions into precise, executable SQL queries that follow banking data governance standards."""
+    # Check forbidden keywords
+    for word in FORBIDDEN:
+        if word in q:
+            return word
+
+    # Allow LLM errors to pass (we only check forbidden topics)
+    return None
 
 def generate_sql(question):
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",  # Changed to a free model
+        model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question}
         ]
     )
-    # FIXED: Removed the early return statement
+
     sql = response.choices[0].message.content.strip()
-    
-    # Remove markdown code blocks if present
-    if sql.startswith("```sql"):
-        sql = sql[6:] 
-    if sql.startswith("```"):
-        sql = sql[3:] 
-    if sql.endswith("```"):
-        sql = sql[:-3]  
-    
-    return sql.strip()
+
+    # Clean markdown fences
+    sql = sql.replace("```sql", "").replace("```", "").strip()
+    return sql
 
 def run_sql(sql):
     try:
@@ -104,25 +103,94 @@ def run_sql(sql):
     except Exception as e:
         return f"SQL Error: {e}"
 
+def detect_simple_anomalies():
+    df = pd.read_sql_query("SELECT * FROM transactions", conn)
+    if len(df) < 50:
+        print("Not enough data for anomaly detection.")
+        return None
+
+    df["hour"] = pd.to_datetime(df["date"]).dt.hour
+    model = IsolationForest(contamination=0.1, random_state=42)
+    df["is_anomaly"] = model.fit_predict(df[["amount", "hour"]])
+
+    anomalies = df[df["is_anomaly"] == -1]
+    print(f"Detected {len(anomalies)} unusual transactions.")
+    return anomalies
 
 def ask(question):
     print("\nUser Question:", question)
 
+    invalid = is_invalid_question(question)
+
+    if invalid:
+        print(f"\nData not available for: '{invalid}'")
+
+        examples = get_available_data_examples()
+        print("\nYou CAN ask about:")
+        for group, items in examples.items():
+            print(f"  {group.upper()}:")
+            for item in items:
+                print(f"   • {item}")
+
+        return pd.DataFrame({
+            "Status": ["Data Not Available"],
+            "Reason": [f"'{invalid}' is not part of the banking database"],
+            "Try Asking About": ["customers, accounts, loans, transactions"]
+        })
+
     sql = generate_sql(question)
     print("\nGenerated SQL:\n", sql)
 
+    # If LLM says invalid schema → convert to our message
+    if "data not available" in sql.lower():
+        print("LLM says data unavailable. Redirecting…")
+        return pd.DataFrame({
+            "Status": ["Data Not Available"],
+            "Reason": ["Query outside available schema"],
+            "Try Asking About": ["customers, accounts, loans, transactions"]
+        })
+
     result = run_sql(sql)
-        # Check if result is an empty DataFrame
-    if isinstance(result, pd.DataFrame):
-        if result.empty:
-            print("\nSQL Result: No records match the query criteria")
-        else:
-            print(f"\nSQL Result ({len(result)} records found):")
-            print(result)
-    else:
-        # Handle SQL errors
-        print("\nSQL Result:", result)
-    
+
+    # SQL ERROR
+    if not isinstance(result, pd.DataFrame):
+        print("\nSQL ERROR:", result)
+        return pd.DataFrame({"Error": [result]})
+
+    # EMPTY RESULT
+    if result.empty:
+        print("\n⚠ No matching rows.")
+        return pd.DataFrame({"Message": ["No results found"]})
+
+    # ----------------------------------------------------------
+    # 4️⃣ Success → Save + return
+    # ----------------------------------------------------------
+    print(f"\nFound {len(result)} rows.")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"Bank_Query_{len(result)}rows_{timestamp}.xlsx"
+    result.to_excel(filename, index=False)
+    print("Saved:", filename)
+
+    # Run anomaly detection when transactions are involved
+    if "transaction" in question.lower():
+        detect_simple_anomalies()
+
     return result
 
-ask("show me a new table with category of balance summayr how many in each category i want 100-600 600-1000 1000-2000 more thn 2000")
+
+# =====================================================================
+# OPTIONAL HELPERS
+# =====================================================================
+def get_dataframes():
+    return {
+        "customer": customer,
+        "account": account,
+        "loan": loan,
+        "transactions": transaction,
+    }
+
+
+# TEST
+print("\nTEST QUERY:")
+print(ask("customers grouped by nationality"))
