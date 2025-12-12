@@ -134,7 +134,7 @@ if st.sidebar.button("Clear Upload"):
 # MAIN UI
 ############################################
 st.markdown("<h1 class='title'>Arura</h1>", unsafe_allow_html=True)
-st.markdown("<p class='subtitle'>Ask anything about your banking data — Arura handles the SQL.</p>", unsafe_allow_html=True)
+st.markdown("<p class='subtitle'>AYour intelligent banking SQL assistant! Curious about something in your database? Ask me! I’ll look across all your tables and return the answer faster than you think.</p>", unsafe_allow_html=True)
 
 question = st.text_input("", placeholder="e.g. Get phone numbers for uploaded customers")
 
